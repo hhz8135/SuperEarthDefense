@@ -32,7 +32,7 @@
 - 本地开关配置文件路径：`%LOCALAPPDATA%\CowboyBingus\Helldivers2\SuperEarthDefense.enabled`（内容为 `1` 或 `0`，默认开启）。
 - 联机时以**房主**的设置为准；队友在房内修改自己的菜单开关不会影响当前房间，只会在离房后或以后自己开房时生效。
 - 诊断日志：`mod-pack.35c39371-a83a-5553-825d-7ceefb7c5ff2.log`。正常命中时会记录 `Super Earth Defense: applied to WarSeason Status`。
-- 已知待确认项：两端星图表现、晚加入（Late Join）以及联机空降流程仍需进一步实机验证。
+
 
 ## 目录结构
 
@@ -82,4 +82,4 @@ A standalone **HellForge** native mod for **Helldivers 2** that opens all seven 
 
 - Local preference file: `%LOCALAPPDATA%\CowboyBingus\Helldivers2\SuperEarthDefense.enabled` (`1` or `0`, defaults to enabled).
 - Log file: `mod-pack.35c39371-a83a-5553-825d-7ceefb7c5ff2.log` (logs `Super Earth Defense: applied to WarSeason Status` on success).
-- Note: Two-client galactic map display, late-join behavior, and co-op hellpod drop still require further live-play verification.
+
