@@ -2,13 +2,13 @@
   "format": 1,
   "id": "pack.35c39371-a83a-5553-825d-7ceefb7c5ff2",
   "name": "超级地球保卫战",
-  "version": "0.4.0",
-  "description": "开放超级地球的七座巨型城市。联机时同步房主在模组选项菜单里的设置。",
+  "version": "0.4.4",
+  "description": "开放七座巨型城市，可逐城设置入侵种族，并选择超级地球的敌军变种。联机使用房主设置。",
   "gameplay": true,
   "coop": "shared",
   "code": {
     "dll": "super_earth_defense.dll",
-    "sdk": 16,
+    "sdk": 20,
     "prebuilt": true,
     "game": "25480438"
   }

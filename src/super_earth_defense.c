@@ -7,6 +7,7 @@
 #include <wchar.h>
 
 #include "hellforge_mod.h"
+#include "n11_board.h"
 #include "war_json.h"
 
 enum {
@@ -30,8 +31,18 @@ typedef int (*GetInfo)(void *easy, int info, ...);
 typedef void (*Cleanup)(void *easy);
 
 typedef struct {
+    uint8_t enabled;
+    char cities[7];
+    uint16_t variants;
+} WarSetting;
+
+_Static_assert(sizeof(WarSetting) == 10, "shared setting wire size");
+
+typedef struct {
     void *easy;
     SeRoute route;
+    char cities[7];
+    uint16_t variants;
     size_t expected, received;
     SeBuffer body;
     bool bypass;
@@ -45,49 +56,95 @@ static GetInfo get_info;
 static SRWLOCK pending_lock = SRWLOCK_INIT;
 static Pending pending[MAX_PENDING];
 static wchar_t settings_file[32768];
-static volatile LONG enabled = 1;
+static wchar_t cities_file[32768];
+static wchar_t variants_file[32768];
+static SRWLOCK settings_lock = SRWLOCK_INIT;
+static WarSetting local_setting = {1, {'4','4','4','2','4','4','3'}, SE_VARIANTS_DEFAULT};
 static volatile LONG reported_status;
 static volatile LONG reported_info;
 static volatile LONG reported_failure;
 static volatile LONG reported_enabled = -2;
+static volatile LONG reported_map;
 static volatile LONG armed;
 static ULONGLONG next_share_poll;
 
-static bool read_setting(void)
+static DWORD read_setting_bytes(const wchar_t *path, char *out, DWORD capacity)
 {
-    if (!settings_file[0]) return InterlockedCompareExchange(&enabled, 0, 0) != 0;
-    HANDLE file = CreateFileW(settings_file, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+    if (!path[0]) return 0;
+    HANDLE file = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
         NULL, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, NULL);
-    if (file != INVALID_HANDLE_VALUE) {
-        char value[4];
-        DWORD length = 0;
-        if (ReadFile(file, value, sizeof value, &length, NULL) && length >= 1 && length <= 3 &&
-            (value[0] == '0' || value[0] == '1')) {
-            bool complete = true;
-            for (DWORD i = 1; i < length; ++i) complete &= value[i] == '\r' || value[i] == '\n';
-            if (complete) InterlockedExchange(&enabled, value[0] == '1');
-        }
-        CloseHandle(file);
+    if (file == INVALID_HANDLE_VALUE) return 0;
+    DWORD length = 0;
+    BOOL ok = ReadFile(file, out, capacity, &length, NULL);
+    CloseHandle(file);
+    return ok ? length : 0;
+}
+
+static bool valid_cities(const char cities[7])
+{
+    for (size_t i = 0; i < 7; ++i)
+        if (cities[i] < '2' || cities[i] > '4') return false;
+    return true;
+}
+
+static void read_variants(uint16_t *variants)
+{
+    char data[14];
+    if (read_setting_bytes(variants_file, data, sizeof data) != 13) return;
+    if (data[0] != 'D' && data[0] != 'A' && data[0] != 'C') return;
+    uint16_t mask = 0;
+    for (unsigned i = 0; i < 12; ++i) {
+        if (data[i + 1] == '1') mask |= (uint16_t)(1u << i);
+        else if (data[i + 1] != '0') return;
     }
-    return InterlockedCompareExchange(&enabled, 0, 0) != 0;
+    if (data[0] == 'A') mask = SE_VARIANTS_ALL;
+    if (data[0] == 'D') mask = SE_VARIANTS_DEFAULT;
+    *variants = se_allowed_variants(mask);
 }
 
-static bool read_shared_setting(uint8_t *value)
+static WarSetting read_setting(void)
 {
-    return api->share_get(mod, war_setting_key, value, sizeof *value) == sizeof *value && *value <= 1;
+    AcquireSRWLockExclusive(&settings_lock);
+    char data[8];
+    DWORD bytes = read_setting_bytes(settings_file, data, 4);
+    if (bytes >= 1 && bytes <= 3 && (data[0] == '0' || data[0] == '1')) {
+        bool complete = true;
+        for (DWORD i = 1; i < bytes; ++i) complete &= data[i] == '\r' || data[i] == '\n';
+        if (complete) local_setting.enabled = data[0] == '1';
+    }
+    bytes = read_setting_bytes(cities_file, data, sizeof data);
+    if (bytes == sizeof local_setting.cities && valid_cities(data))
+        memcpy(local_setting.cities, data, sizeof local_setting.cities);
+    read_variants(&local_setting.variants);
+    WarSetting result = local_setting;
+    ReleaseSRWLockExclusive(&settings_lock);
+    return result;
 }
 
-static int effective_setting(void)
+static bool read_shared_setting(WarSetting *value)
 {
+    return api->share_get(mod, war_setting_key, value, sizeof *value) == sizeof *value &&
+        value->enabled <= 1 && valid_cities(value->cities) &&
+        (value->variants <= SE_VARIANTS_WIRE_MASK || value->variants == SE_VARIANTS_DEFAULT);
+}
+
+static int effective_setting(char cities[7], uint16_t *variants)
+{
+    WarSetting value;
     HfSession before = {0};
     api->session(mod, &before);
-    if (before.role != HF_SESSION_JOINER) return read_setting();
-
-    uint8_t value = 0;
-    if (!read_shared_setting(&value)) return WAITING_FOR_HOST;
-    HfSession after = {0};
-    api->session(mod, &after);
-    return after.role == HF_SESSION_JOINER && before.version == after.version ? value : WAITING_FOR_HOST;
+    if (before.role == HF_SESSION_JOINER) {
+        if (!read_shared_setting(&value)) return WAITING_FOR_HOST;
+        HfSession after = {0};
+        api->session(mod, &after);
+        if (after.role != HF_SESSION_JOINER || before.version != after.version ||
+            strncmp(before.host, after.host, sizeof before.host)) return WAITING_FOR_HOST;
+    } else {
+        value = read_setting();
+    }
+    memcpy(cities, value.cities, sizeof value.cities);
+    *variants = se_allowed_variants(value.variants);
+    return value.enabled;
 }
 
 static void publish_host_setting(void)
@@ -95,11 +152,12 @@ static void publish_host_setting(void)
     HfSession session = {0};
     api->session(mod, &session);
     if (session.role != HF_SESSION_HOST) return;
-    uint8_t preference = (uint8_t)read_setting();
-    uint8_t shared = 0;
-    if (!read_shared_setting(&shared) || preference != shared) {
+    WarSetting preference = read_setting();
+    WarSetting shared;
+    if (!read_shared_setting(&shared) || memcmp(&preference, &shared, sizeof preference)) {
         if (!api->share_set(mod, war_setting_key, &preference, sizeof preference))
-            api->log(mod, "Super Earth Defense: host shared its %s setting", preference ? "enabled" : "disabled");
+            api->log(mod, "Super Earth Defense: host shared %s, regions 0-6 %.7s, variants 0x%04x",
+                preference.enabled ? "enabled" : "disabled", preference.cities, (unsigned)preference.variants);
     }
 }
 
@@ -109,6 +167,7 @@ static void on_game_tick(HfMod *owner, float delta, void *user)
     (void)delta;
     (void)user;
     if (!InterlockedCompareExchange(&armed, 0, 0)) return;
+    se_limit_board_difficulty(api, owner);
     ULONGLONG now = GetTickCount64();
     if (now < next_share_poll) return;
     next_share_poll = now + SHARE_INTERVAL_MS;
@@ -184,7 +243,7 @@ static bool replace_body(Pending *response, SeBuffer *replacement)
     while (json_size && response->body.data[json_size - 1] == ' ') --json_size;
     // The stock backend pads these replies. Keep Content-Length and enough spare space for the game's decoder.
     if (response->body.size - json_size < 16 ||
-        !se_rewrite(response->route, response->body.data, json_size, replacement) ||
+        !se_rewrite(response->route, response->body.data, json_size, response->cities, response->variants, replacement) ||
         replacement->size > response->body.size - 16) return false;
     static const char spaces[] = "                                                                ";
     while (replacement->size < response->body.size) {
@@ -211,6 +270,14 @@ static int write_completed(void *easy, Pending *response)
         api->log(mod, "Super Earth Defense: unexpected local war body or padding; original response used");
     }
     int result = original_write(easy, CURL_BODY, payload->data, payload->size);
+    if (result == CURL_OK && replaced && response->route == SE_ROUTE_STATUS) {
+        LONG map = 0;
+        for (size_t i = 0; i < sizeof response->cities; ++i) map = (map << 2) | (response->cities[i] - '1');
+        map = (map << 16) | response->variants;
+        if (InterlockedExchange(&reported_map, map) != map)
+            api->log(mod, "Super Earth Defense: sent city settings (regions 0-6): %.7s, variants 0x%04x",
+                response->cities, (unsigned)response->variants);
+    }
     se_buffer_clear(&replacement);
     se_buffer_clear(&response->body);
     return result;
@@ -236,7 +303,7 @@ static int on_write(void *easy, int type, const char *data, size_t length)
         int64_t content_length = 0;
         // The client may cache WarInfo across lobby joins. Register static city definitions on both sides.
         // Only Status grants the campaign and marks the seven cities playable.
-        int setting = entry->route == SE_ROUTE_INFO ? 1 : effective_setting();
+        int setting = entry->route == SE_ROUTE_INFO ? 1 : effective_setting(entry->cities, &entry->variants);
         if (entry->route == SE_ROUTE_STATUS && InterlockedExchange(&reported_enabled, setting) != setting) {
             const char *state = setting == WAITING_FOR_HOST ? "waiting for the host's setting" : setting ? "enabled" : "disabled";
             api->log(mod, "Super Earth Defense: %s", state);
@@ -301,10 +368,21 @@ HF_MOD_EXPORT int hellforge_mod_init(const HfApi *hf, HfMod *owner)
     api = hf;
     mod = owner;
     const wchar_t suffix[] = L"\\CowboyBingus\\Helldivers2\\SuperEarthDefense.enabled";
+    const wchar_t variant_suffix[] = L"\\CowboyBingus\\Helldivers2\\SuperEarthDefense.variants";
     DWORD size = GetEnvironmentVariableW(L"LOCALAPPDATA", settings_file, (DWORD)(sizeof settings_file / sizeof *settings_file));
-    if (size && size + sizeof suffix / sizeof *suffix <= sizeof settings_file / sizeof *settings_file)
+    if (size && size <= sizeof settings_file / sizeof *settings_file - sizeof variant_suffix / sizeof *variant_suffix) {
+        const wchar_t city_suffix[] = L"\\CowboyBingus\\Helldivers2\\SuperEarthDefense.cities";
+        memcpy(variants_file, settings_file, size * sizeof *variants_file);
+        memcpy(variants_file + size, variant_suffix, sizeof variant_suffix);
+        memcpy(cities_file, settings_file, size * sizeof *cities_file);
+        memcpy(cities_file + size, city_suffix, sizeof city_suffix);
         memcpy(settings_file + size, suffix, sizeof suffix);
-    else settings_file[0] = 0;
+    } else settings_file[0] = 0;
+    // HellForge reads this when it installs level 11 (after mod init). x1.5 street props are a suspected mega-city crash;
+    // set it regardless of the menu toggle so every player in a lobby generates the same map. A player's own value wins.
+    if (!GetEnvironmentVariableW(L"HELLFORGE_D11_STREET_PROPS", NULL, 0) &&
+        SetEnvironmentVariableW(L"HELLFORGE_D11_STREET_PROPS", L"0"))
+        hf->log(owner, "Super Earth Defense: HELLFORGE_D11_STREET_PROPS=0 (level 11 keeps level 10's street props)");
     if (hf->on_game_thread(owner, on_game_tick, NULL) != 1) {
         hf->log(owner, "Super Earth Defense: could not register the lobby setting update");
         return 1;
